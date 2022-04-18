@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+
+usage_error () { echo >&2 "$(basename $0):  $1"; exit 2; }
+assert_argument () { test "$1" != "$EOL" || usage_error "$2 requires an argument"; }
+
+shell_quote() {
+    # run in a subshell to protect the caller's environment
+    (
+        sep=''
+        for arg in "$@"; do
+            sqesc=$(printf '%s\n' "${arg}" | sed -e "s/'/'\\\\''/g")
+            printf '%s' "${sep}'${sqesc}'"
+            sep=' '
+        done
+    )
+}
+
+show_options() {
+    echo "Usage: ocperf2bolt [OPTIONS] [EXECUTABLE]";
+    echo "Options:";
+    echo "-n / --nl                     - Aggregate basic samples (without LBR info). Default: disabled";
+    echo "-v / --verbose                - Enable verbose mode. Default: disabled";
+    echo "-b / --nobar                  - Disable --eta --progress --bar in parallel. Default: enabled";
+    echo "-i / --ignore-build-id        - Ignore build id. Default: disabled";
+    echo "-j / --jobs                   - Number of concurrent parallel jobs. Default: 10";
+    echo "-d [path] / --dir=[path]      - Diretory of the input .data profiles. Default: ./";
+    echo "-o [path] / --out=[path]      - Diretory of the output .fdata profiles. Default: ./";
+    echo "-t [path] / --tmpdir=[path]   - Temporary directory for perf2bolt processing. Default: /tmp";
+    echo "";
+    echo "Set environment variable OCPERF2BOLT_LOGGING=1 to enable logging";
+}
+
+function check_output_lbr_file_exists() {
+    local num="$1";
+    local output_dir="$2";
+    while :
+    do
+        if [[ ! -f "${output_dir}perflbr${num}.fdata" ]]; then
+            echo "$num";
+            break;
+        else
+            ((num++))
+        fi
+    done
+}
+
+function check_output_mem_file_exists() {
+    local num="$1";
+    local output_dir="$2";
+    while :
+    do
+        if [[ ! -f "${output_dir}perfmem${num}.fdata" ]]; then
+            echo "$num";
+            break;
+        else
+            ((num++))
+        fi
+    done
+}
+
+if [[ "$#" -lt 1 ]]; then
+    show_options;
+    exit 1;
+fi
+
+LOGGING=""
+if [[ -z "${OCPERF2BOLT_LOGGING+x}" ]]; then
+    LOGGING=0;
+else
+    LOGGING=1;
+fi
+
+if [ "$#" != 0 ]; then
+  EOL=$(echo '\01\03\03\07')
+  set -- "$@" "$EOL"
+  while [ "$1" != "$EOL" ]; do
+    opt="$1"; shift
+    case "$opt" in
+
+    # Your options go here.
+    -h|--help) help='true';;
+    -n|--nl) nl='true';;
+    -b|--nobar) nobar='true';;
+    -v|--verbose) verbose='true';;
+    -i|--ignore-build-id) ignore_build_id='true';;
+    -j|--jobs) assert_argument "$1" "$opt"; jobs="$1"; shift;;
+    -d|--dir) assert_argument "$1" "$opt"; dir="$1"; shift;;
+    -o|--out) assert_argument "$1" "$opt"; out="$1"; shift;;
+    -t|--tmpdir) assert_argument "$1" "$opt"; tmp_dir="$1"; shift;;
+
+    # Arguments processing. You may remove any unneeded line after the 1st.
+    -|''|[!-]*) set -- "$@" "$opt";;                                          # positional argument, rotate to the end
+    --*=*)      set -- "${opt%%=*}" "${opt#*=}" "$@";;                        # convert '--name=arg' to '--name' 'arg'
+    -[!-]?*)    set -- $(echo "${opt#-}" | sed 's/\(.\)/ -\1/g') "$@";;       # convert '-abc' to '-a' '-b' '-c'
+    --)         while [ "$1" != "$EOL" ]; do set -- "$@" "$1"; shift; done;;  # process remaining arguments as positional
+    -*)         usage_error "unknown option: '$opt'";;                        # catch misspelled options
+    *)          usage_error "this should NEVER happen ($opt)";;               # sanity test for previous patterns
+
+    esac
+  done
+  shift  # $EOL
+fi
+
+VERBOSE_OPT="";
+TMP_DIR="/tmp";
+OUTPUT_DIR="./";
+INPUT_DIR="./";
+# NL_OPT="";
+JOBS_OPT=10;
+IGNORE_BUILD_ID_OPT="";
+BAR_OPT="--eta --progress --bar";
+if [[ ! -z "${help+x}" ]]; then
+    show_options;
+    exit 0;
+fi
+
+if [[ ! -z "${jobs+x}" ]]; then
+    JOBS_OPT="$jobs";
+fi
+if [[ ! -z "${verbose+x}" ]]; then
+    VERBOSE_OPT="$verbose";
+fi
+if [[ ! -z "${nl+x}" ]]; then
+    NL_OPT="--nl";
+fi
+if [[ ! -z "${nobar+x}" ]]; then
+    BAR_OPT="";
+fi
+if [[ ! -z "${ignore_build_id+x}" ]]; then
+    IGNORE_BUILD_ID_OPT="--ignore-build-id";
+fi
+if [[ ! -z "${tmp_dir+x}" ]]; then
+    TMP_DIR="$tmp_dir";
+fi
+if [[ ! -z "${dir+x}" ]]; then
+    INPUT_DIR="$dir";
+fi
+if [[ ! -z "${out+x}" ]]; then
+    OUTPUT_DIR="$out";
+fi
+
+if [[ "${OUTPUT_DIR: -1}" != "/" ]]; then
+    OUTPUT_DIR="${OUTPUT_DIR}/";
+fi
+if [[ "${INPUT_DIR: -1}" != "/" ]]; then
+    INPUT_DIR="${INPUT_DIR}/";
+fi
+
+declare -a COMMAND_LIST;
+input="";
+output="";
+numoutput_lbr=1;
+numoutput_mem=1;
+no_lbr_files=0;
+no_mem_files=0;
+readarray -d '' filelistlbr < <(find "${INPUT_DIR}" -type f -iname perflbr\*.data -print0 | sort -zV);
+if [[ "${#filelistlbr[@]}" > 0 ]]; then
+    for inputfile in "${filelistlbr[@]}"; do
+        input="$inputfile";
+        numoutput_lbr="$(check_output_lbr_file_exists $numoutput_lbr $OUTPUT_DIR)";
+        output="${OUTPUT_DIR}perflbr${numoutput_lbr}.fdata";
+        command_to_run="";
+        if [[ $LOGGING == "1" ]]; then
+            command_to_run="perf2bolt ${IGNORE_BUILD_ID_OPT:+${IGNORE_BUILD_ID_OPT}} ${NL_OPT:+${NL_OPT}} --jump-tables=split --strict=1 --relocs=1 --lite=0 --perfdata=$input -o=$output "$(shell_quote "$@")" >> ${OUTPUT_DIR}ocperf2boltlbr-$numoutput_lbr.txt 2>&1";
+            COMMAND_LIST+=("$command_to_run");
+        else
+            command_to_run="perf2bolt ${IGNORE_BUILD_ID_OPT:+${IGNORE_BUILD_ID_OPT}} ${NL_OPT:+${NL_OPT}} --jump-tables=split --strict=1 --relocs=1 --lite=0 --perfdata=$input -o=$output "$(shell_quote "$@")" > /dev/null 2>&1";
+            COMMAND_LIST+=("$command_to_run");
+        fi
+        ((numoutput_lbr++))
+    done
+else
+    no_lbr_files=1;
+    echo "No perflbrX.data files found in $INPUT_DIR";
+fi
+
+readarray -d '' filelistmem < <(find "${INPUT_DIR}" -type f -iname perfmem\*.data -print0 | sort -zV);
+if [[ "${#filelistmem[@]}" > 0 ]]; then
+    for inputfile in "${filelistmem[@]}"; do
+        input="$inputfile";
+        numoutput_mem="$(check_output_mem_file_exists $numoutput_mem $OUTPUT_DIR)";
+        output="${OUTPUT_DIR}perfmem${numoutput_mem}.fdata";
+        command_to_run="";
+        if [[ $LOGGING == "1" ]]; then
+            command_to_run="perf2bolt ${IGNORE_BUILD_ID_OPT:+${IGNORE_BUILD_ID_OPT}} ${NL_OPT:+${NL_OPT}} --jump-tables=split --strict=1 --relocs=1 --lite=0 --perfdata=$input -o=$output "$(shell_quote "$@")" >> ${OUTPUT_DIR}ocperf2boltmem-$numoutput_mem.txt 2>&1";
+            COMMAND_LIST+=("$command_to_run");
+        else
+            command_to_run="perf2bolt ${IGNORE_BUILD_ID_OPT:+${IGNORE_BUILD_ID_OPT}} ${NL_OPT:+${NL_OPT}} --jump-tables=split --strict=1 --relocs=1 --lite=0 --perfdata=$input -o=$output "$(shell_quote "$@")" > /dev/null 2>&1";
+            COMMAND_LIST+=("$command_to_run");
+        fi
+        ((numoutput_mem++))
+    done
+else
+    no_mem_files=1;
+    echo "No perfmemX.data files found in $INPUT_DIR";
+fi
+
+if [[ $no_lbr_files == 1 ]] && [[ $no_mem_files == 1 ]]; then
+    exit 1;
+fi
+
+echo "Jobs: $JOBS_OPT";
+if [[ ! -z "${VERBOSE_OPT+x}" ]]; then
+    for i in "${!COMMAND_LIST[@]}"; do
+        printf '%s\n' "${COMMAND_LIST[i]}";
+    done
+fi
+
+if [[ "${#COMMAND_LIST[@]}" > 0 ]]; then
+    parallel --tmpdir ${TMP_DIR:+${TMP_DIR}} ${BAR_OPT:+${BAR_OPT}} --nice -10 --halt now,fail=1 --jobs $JOBS_OPT ::: "${COMMAND_LIST[@]}";
+fi
+
+if [[ $LOGGING == "1" ]]; then
+    sleep 1;
+    readarray -d '' loglistlbr < <(find "${OUTPUT_DIR}" -type f -iname ocperf2boltlbr-\*.txt -print0 | sort -zV);
+    if [[ "${#loglistlbr[@]}" > 0 ]]; then
+        for inputfile in "${loglistlbr[@]}"; do
+            cat "$inputfile" >> ${OUTPUT_DIR}ocperf2boltlbr.txt;
+            echo " " >> ${OUTPUT_DIR}ocperf2boltlbr.txt;
+            echo " " >> ${OUTPUT_DIR}ocperf2boltlbr.txt;
+            rm "$inputfile";
+        done
+    fi
+    readarray -d '' loglistmem < <(find "${OUTPUT_DIR}" -type f -iname ocperf2boltmem-\*.txt -print0 | sort -zV);
+    if [[ "${#loglistmem[@]}" > 0 ]]; then
+        for inputfile in "${loglistmem[@]}"; do
+            cat "$inputfile" >> ${OUTPUT_DIR}ocperf2boltmem.txt;
+            echo " " >> ${OUTPUT_DIR}ocperf2boltmem.txt;
+            echo " " >> ${OUTPUT_DIR}ocperf2boltmem.txt;
+            rm "$inputfile";
+        done
+    fi
+fi
+
+sleep 1;
+declare -a MERGE_LIST_LBR;
+readarray -d '' fdatalist_lbr < <(find "${OUTPUT_DIR}" -type f -iname perflbr\*.fdata -print0 | sort -zV);
+if [[ "${#fdatalist_lbr[@]}" > 0 ]]; then
+    for inputfilelbr in "${fdatalist_lbr[@]}"; do
+        if [[ -s "$inputfilelbr" ]]; then
+            MERGE_LIST_LBR+=("$inputfilelbr");
+        else
+            mv "$inputfilelbr" "$inputfilelbr-empty";
+            echo "$inputfilelbr is empty. Renamed.";
+        fi
+    done
+
+    if [[ "${#MERGE_LIST_LBR[@]}" > 0 ]]; then
+        if [[ -f "${OUTPUT_DIR}combined_lbr.fdata" ]]; then
+            mv ${OUTPUT_DIR}combined_lbr.fdata ${OUTPUT_DIR}combined_lbr2.fdata;
+            merge-fdata ${MERGE_LIST_LBR[*]} ${OUTPUT_DIR}combined_lbr2.fdata > ${OUTPUT_DIR}combined_lbr.fdata;
+            rm ${OUTPUT_DIR}combined_lbr2.fdata;
+        else
+            merge-fdata ${MERGE_LIST_LBR[*]} > ${OUTPUT_DIR}combined_lbr.fdata;
+        fi
+    fi
+fi
+
+
+declare -a MERGE_LIST_MEM;
+readarray -d '' fdatalist_mem < <(find "${OUTPUT_DIR}" -type f -iname perfmem\*.fdata -print0 | sort -zV);
+if [[ "${#fdatalist_mem[@]}" > 0 ]]; then
+    for inputfilemem in "${fdatalist_mem[@]}"; do
+        if [[ -s "$inputfilemem" ]]; then
+            MERGE_LIST_MEM+=("$inputfilemem");
+        else
+            mv "$inputfilemem" "$inputfilemem-empty";
+            echo "$inputfilemem is empty. Renamed.";
+        fi
+    done
+
+    if [[ "${#MERGE_LIST_MEM[@]}" > 0 ]]; then
+        if [[ -f "${OUTPUT_DIR}combined_mem.fdata" ]]; then
+            mv ${OUTPUT_DIR}combined_mem.fdata ${OUTPUT_DIR}combined_mem2.fdata;
+            merge-fdata ${MERGE_LIST_MEM[*]} ${OUTPUT_DIR}combined_mem2.fdata > ${OUTPUT_DIR}combined_mem.fdata;
+            rm ${OUTPUT_DIR}combined_mem2.fdata;
+        else
+            merge-fdata ${MERGE_LIST_MEM[*]} > ${OUTPUT_DIR}combined_mem.fdata;
+        fi
+    fi
+fi
+
+if [[ -f "${OUTPUT_DIR}combined_lbr.fdata" ]] && [[ -f "${OUTPUT_DIR}combined_mem.fdata" ]]; then
+#     merge-fdata ${OUTPUT_DIR}combined_lbr.fdata ${OUTPUT_DIR}combined_mem.fdata > ${OUTPUT_DIR}combined.fdata;
+    cp ${OUTPUT_DIR}combined_lbr.fdata ${OUTPUT_DIR}combined.fdata;
+    cat ${OUTPUT_DIR}combined_mem.fdata >> ${OUTPUT_DIR}combined.fdata;
+    rm -rf ${TMP_DIR}/*
+    exit 0;
+elif [[ -f "${OUTPUT_DIR}combined_lbr.fdata" ]]; then
+    cat ${OUTPUT_DIR}combined_lbr.fdata | sort > ${OUTPUT_DIR}combined.fdata;
+    rm -rf ${TMP_DIR}/*
+    exit 0;
+elif [[ -f "${OUTPUT_DIR}combined_mem.fdata" ]]; then
+    cp ${OUTPUT_DIR}combined_mem.fdata ${OUTPUT_DIR}combined.fdata;
+    rm -rf ${TMP_DIR}/*
+    exit 0;
+fi

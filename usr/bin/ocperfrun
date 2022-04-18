@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -Eeo pipefail
+
+exit_on_error() {
+#     last_command=$current_command;
+#     current_command=$BASH_COMMAND;
+    exit_code=$1;
+#     >&2 notify-send "\"${BASH_COMMAND}\" command failed with exit code ${exit_code}" --expire-time=5000;
+    echo -e "[\033[31;1mFATAL\033[0m] \"${BASH_COMMAND}\" command failed with exit code ${exit_code}";
+}
+
+usage_error () { echo >&2 "$(basename $0):  $1"; exit 2; }
+assert_argument () { test "$1" != "$EOL" || usage_error "$2 requires an argument"; }
+
+trap 'exit_on_error $?' ERR
+
+show_options() {
+    echo "Usage: ocperfrunsettings [OPTIONS]";
+    echo "Options:";
+    echo "-p [1/0] / --perfeventparanoid=[1/0]";
+    echo "-m [int] / --perfeventmaxsamplerate=[int]";
+    echo "-s [int] / --perfeventmaxstack=[int]";
+    echo "-c [0-100] / --perfcputimemaxpercent=[0-100] (0=disable the mechanism)";
+    echo "";
+    echo "Set environment variable OCPERFRUNSETTINGS_LOGGING=1 to enable logging";
+}
+
+if [[ "$#" -lt 1 ]]; then
+    show_options;
+    exit 1;
+fi
+
+LOGGING=""
+if [[ -z "${OCPERFRUNSETTINGS_LOGGING+x}" ]]; then
+    LOGGING=0;
+else
+    LOGGING=1;
+fi
+
+# perf_cpu_time_max_percent:
+#
+# Hints to the kernel how much CPU time it should be allowed to
+# use to handle perf sampling events.  If the perf subsystem
+# is informed that its samples are exceeding this limit, it
+# will drop its sampling frequency to attempt to reduce its CPU
+# usage.
+#
+# Some perf sampling happens in NMIs.  If these samples
+# unexpectedly take too long to execute, the NMIs can become
+# stacked up next to each other so much that nothing else is
+# allowed to execute.
+#
+# 0: disable the mechanism.  Do not monitor or correct perf's
+#    sampling rate no matter how CPU time it takes.
+#
+# 1-100: attempt to throttle perf's sample rate to this
+#    percentage of CPU.  Note: the kernel calculates an
+#    "expected" length of each sample event.  100 here means
+#    100% of that expected length.  Even if this is set to
+#    100, you may still see sample throttling if this
+#    length is exceeded.  Set to 0 if you truly do not care
+#    how much CPU is consumed.
+# OCPERF_COMMAND_MAX_SAMPLE="sudo sysctl -w kernel.perf_event_paranoid=-1 -w kernel.perf_event_max_sample_rate=200000 -w kernel.perf_event_max_stack=1000 -w kernel.perf_cpu_time_max_percent=99 >> ocperfrunsettings.txt 2>&1";
+# OCPERF_COMMAND_MAX_SAMPLE="sudo sysctl -w kernel.perf_event_paranoid=-1 -w kernel.perf_event_max_sample_rate=120000 -w kernel.perf_event_max_stack=1000 -w kernel.perf_cpu_time_max_percent=0 >> ocperfrunsettings.txt 2>&1";
+
+
+if [ "$#" != 0 ]; then
+  EOL=$(echo '\01\03\03\07')
+  set -- "$@" "$EOL"
+  while [ "$1" != "$EOL" ]; do
+    opt="$1"; shift
+    case "$opt" in
+
+    # Your options go here.
+    -h|--help) help='true';;
+    -p|--perf_event_paranoid) assert_argument "$1" "$opt"; perf_event_paranoid="$1"; shift;;
+    -m|--perf_event_max_sample_rate) assert_argument "$1" "$opt"; perf_event_max_sample_rate="$1"; shift;;
+    -s|--perf_event_max_stack) assert_argument "$1" "$opt"; perf_event_max_stack="$1"; shift;;
+    -ms|--perf_event_max_contexts_per_stack) assert_argument "$1" "$opt"; perf_event_max_contexts_per_stack="$1"; shift;;
+    -ml|--perf_event_mlock_kb) assert_argument "$1" "$opt"; perf_event_mlock_kb="$1"; shift;;
+    -c|--perf_cpu_time_max_percent) assert_argument "$1" "$opt"; perf_cpu_time_max_percent="$1"; shift;;
+
+    # Arguments processing. You may remove any unneeded line after the 1st.
+    -|''|[!-]*) set -- "$@" "$opt";;                                          # positional argument, rotate to the end
+    --*=*)      set -- "${opt%%=*}" "${opt#*=}" "$@";;                        # convert '--name=arg' to '--name' 'arg'
+    -[!-]?*)    set -- $(echo "${opt#-}" | sed 's/\(.\)/ -\1/g') "$@";;       # convert '-abc' to '-a' '-b' '-c'
+    --)         while [ "$1" != "$EOL" ]; do set -- "$@" "$1"; shift; done;;  # process remaining arguments as positional
+    -*)         usage_error "unknown option: '$opt'";;                        # catch misspelled options
+    *)          usage_error "this should NEVER happen ($opt)";;               # sanity test for previous patterns
+
+    esac
+  done
+  shift  # $EOL
+fi
+
+if [[ ! -z "${help+x}" ]]; then
+    show_options;
+    exit 0;
+fi
+
+# max_percent_set=$(sudo sysctl --values kernel.perf_cpu_time_max_percent);
+# if [[ ${perf_cpu_time_max_percent} == "0" ]] && [[ ! -z "${perf_event_max_sample_rate+x}" ]]; then
+#     echo "The perf_cpu_time_max_percent setting equal to 0 makes perf_event_max_sample_rate setting irrelevant";
+#     exit 1;
+# elif [[ ${max_percent_set} == "0" ]] && [[ ${perf_cpu_time_max_percent} == "0" ]] && [[ ! -z "${perf_event_max_sample_rate+x}" ]]; then
+#     echo "The current kernel.perf_cpu_time_max_percent is 0 and makes perf_event_max_sample_rate setting irrelevant";
+#     exit 1;
+# fi
+
+OCPERFRUNSETTINGS_ULIMIT_U_COMMAND="sudo -sE ulimit -u unlimited"
+OCPERFRUNSETTINGS_COMMAND_FINAL=""
+OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT=""
+OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT_FIRST=""
+OCPERFRUNSETTINGS_COMMAND="sudo sysctl"
+OCPERFRUNSETTINGS_OPTS=""
+OCPERFRUNSETTINGS_OPTS_MAX_PERCENT=""
+OCPERFRUNSETTINGS_OPTS_MAX_PERCENT_FIRST=""
+if [[ ! -z "${perf_event_paranoid+x}" ]]; then
+    OCPERFRUNSETTINGS_OPTS="${OCPERFRUNSETTINGS_OPTS} -w kernel.perf_event_paranoid=${perf_event_paranoid}";
+fi
+if [[ ! -z "${perf_event_max_sample_rate+x}" ]]; then
+    OCPERFRUNSETTINGS_OPTS="${OCPERFRUNSETTINGS_OPTS} -w kernel.perf_event_max_sample_rate=${perf_event_max_sample_rate}";
+fi
+if [[ ! -z "${perf_event_max_stack+x}" ]]; then
+    OCPERFRUNSETTINGS_OPTS="${OCPERFRUNSETTINGS_OPTS} -w kernel.perf_event_max_stack=${perf_event_max_stack}";
+fi
+if [[ ! -z "${perf_event_max_contexts_per_stack+x}" ]]; then
+    OCPERFRUNSETTINGS_OPTS="${OCPERFRUNSETTINGS_OPTS} -w kernel.perf_event_max_contexts_per_stack=${perf_event_max_contexts_per_stack}";
+fi
+if [[ ! -z "${perf_event_mlock_kb+x}" ]]; then
+    OCPERFRUNSETTINGS_OPTS="${OCPERFRUNSETTINGS_OPTS} -w kernel.perf_event_mlock_kb=${perf_event_mlock_kb}";
+fi
+if [[ ! -z "${perf_cpu_time_max_percent+x}" ]]; then
+    OCPERFRUNSETTINGS_OPTS_MAX_PERCENT="${OCPERFRUNSETTINGS_OPTS_MAX_PERCENT} -w kernel.perf_cpu_time_max_percent=${perf_cpu_time_max_percent}";
+    OCPERFRUNSETTINGS_OPTS_MAX_PERCENT_FIRST="${OCPERFRUNSETTINGS_OPTS_MAX_PERCENT_FIRST} -w kernel.perf_cpu_time_max_percent=99";
+fi
+
+if [[ $LOGGING == "1" ]]; then
+    OCPERFRUNSETTINGS_COMMAND_FINAL="$OCPERFRUNSETTINGS_COMMAND $OCPERFRUNSETTINGS_OPTS >> ocperfrunsettings.txt 2>&1";
+    OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT_FIRST="$OCPERFRUNSETTINGS_COMMAND $OCPERFRUNSETTINGS_OPTS_MAX_PERCENT_FIRST >> ocperfrunsettings.txt 2>&1";
+    OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT="$OCPERFRUNSETTINGS_COMMAND $OCPERFRUNSETTINGS_OPTS_MAX_PERCENT >> ocperfrunsettings.txt 2>&1";
+else
+    OCPERFRUNSETTINGS_COMMAND_FINAL="$OCPERFRUNSETTINGS_COMMAND $OCPERFRUNSETTINGS_OPTS > /dev/null 2>&1";
+    OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT_FIRST="$OCPERFRUNSETTINGS_COMMAND $OCPERFRUNSETTINGS_OPTS_MAX_PERCENT_FIRST > /dev/null 2>&1";
+    OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT="$OCPERFRUNSETTINGS_COMMAND $OCPERFRUNSETTINGS_OPTS_MAX_PERCENT > /dev/null 2>&1";
+fi
+
+# ocperfrunsettings --perf_event_paranoid=-1 --perf_event_max_stack=1000 --perf_event_max_contexts_per_stack=16 --perf_event_mlock_kb=1028 --perf_cpu_time_max_percent=0 --perf_event_max_sample_rate=110000
+# if [[ ! -z "${OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT+x}" ]]; then
+#     echo ${OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT_FIRST};
+# fi
+# echo ${OCPERFRUNSETTINGS_COMMAND_FINAL};
+# if [[ ! -z "${OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT+x}" ]]; then
+#     echo ${OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT};
+# fi
+
+
+if [[ ! -z "${OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT+x}" ]]; then
+    eval "${OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT_FIRST}";
+fi
+eval "${OCPERFRUNSETTINGS_COMMAND_FINAL}";
+if [[ ! -z "${OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT+x}" ]]; then
+    eval "${OCPERFRUNSETTINGS_COMMAND_FINAL_MAX_PERCENT}";
+fi
+
+eval "${OCPERFRUNSETTINGS_ULIMIT_U_COMMAND}";
+
+grep -H '' /proc/sys/kernel/perf_*;

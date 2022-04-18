@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+
+usage_error () { echo >&2 "$(basename $0):  $1"; exit 2; }
+assert_argument () { test "$1" != "$EOL" || usage_error "$2 requires an argument"; }
+
+shell_quote() {
+    # run in a subshell to protect the caller's environment
+    (
+        sep=''
+        for arg in "$@"; do
+            sqesc=$(printf '%s\n' "${arg}" | sed -e "s/'/'\\\\''/g")
+            printf '%s' "${sep}'${sqesc}'"
+            sep=' '
+        done
+    )
+}
+
+show_options() {
+    echo "Usage: ocperfrun [OPTIONS] -- [COMMAND]";
+    echo "Options:";
+    echo "-f ['max' or int] / --freq=['max' or int]   - Frequency for ocperf. Default: 100000";
+    echo "-d [path] / --dir=[path]                    - Diretory to output profile data. Default: ./";
+    echo "-l [int] / --ldlat=[int]                    - Latency for (cpu/mem-loads,ldlat=x/pp). Default: 10";
+    echo "-v / --verbose                              - Enable verbose for ocperf. Default: disabled";
+    echo "-m / --mem                                  - Enable memory profiling for ocperf (cpu/mem-loads,ldlat=x/pp). Default: disabled or LBR profiling";
+    echo "-f / --full                                 - Enable memory profiling for ocperf (cpu/mem-loads,ldlat=x/pp) and LBR profiling. Default: disabled or LBR profiling";
+    echo "-a / --all-cpu                              - Enable system-wide collection from all CPUs. Default: disable";
+    echo "";
+    echo "Set environment variable OCPERF_LOGGING=1 to enable logging";
+    echo "Set environment variable OCPERF_VERBOSE=1 to show the output of the binary";
+}
+
+function check_perflbr_exists() {
+    local directory="$1";
+    local func_result="result";
+    local num=1;
+    while :
+    do
+        if [[ ! -f "${directory}perflbr${num}.data" ]]; then
+            func_result="perflbr${num}.data";
+            echo "$func_result";
+            break;
+        fi
+        ((num++))
+    done
+}
+
+function check_perfmem_exists() {
+    local directory="$1";
+    local func_result="result";
+    local num=1;
+    while :
+    do
+        if [[ ! -f "${directory}perfmem${num}.data" ]]; then
+            func_result="perfmem${num}.data";
+            echo "$func_result";
+            break;
+        fi
+        ((num++))
+    done
+}
+
+if [[ "$#" -lt 1 ]]; then
+    show_options;
+    exit 1;
+fi
+
+LOGGING=""
+VERBOSE=""
+if [[ -z "${OCPERF_LOGGING+x}" ]]; then
+    LOGGING=0;
+else
+    LOGGING=1;
+fi
+
+if [[ -z "${OCPERF_VERBOSE+x}" ]]; then
+    VERBOSE=0;
+else
+    VERBOSE=1;
+fi
+
+if [ "$#" != 0 ]; then
+  EOL=$(echo '\01\03\03\07')
+  set -- "$@" "$EOL"
+  while [ "$1" != "$EOL" ]; do
+    opt="$1"; shift
+    case "$opt" in
+
+    # Your options go here.
+    -h|--help) help='true';;
+    -m|--mem) mem='true';;
+    -f|--full) full='true';;
+    -v|--verbose) verbose='true';;
+    -a|--all-cpu) allcpu='true';;
+    -f|--freq) assert_argument "$1" "$opt"; freq="$1"; shift;;
+    -d|--dir) assert_argument "$1" "$opt"; dir="$1"; shift;;
+    -l|--ldlat) assert_argument "$1" "$opt"; ldlat="$1"; shift;;
+
+    # Arguments processing. You may remove any unneeded line after the 1st.
+    -|''|[!-]*) set -- "$@" "$opt";;                                          # positional argument, rotate to the end
+    --*=*)      set -- "${opt%%=*}" "${opt#*=}" "$@";;                        # convert '--name=arg' to '--name' 'arg'
+    -[!-]?*)    set -- $(echo "${opt#-}" | sed 's/\(.\)/ -\1/g') "$@";;       # convert '-abc' to '-a' '-b' '-c'
+    --)         while [ "$1" != "$EOL" ]; do set -- "$@" "$1"; shift; done;;  # process remaining arguments as positional
+    -*)         usage_error "unknown option: '$opt'";;                        # catch misspelled options
+    *)          usage_error "this should NEVER happen ($opt)";;               # sanity test for previous patterns
+
+    esac
+  done
+  shift  # $EOL
+fi
+
+OUTPUT_DIR="./";
+LDLAT_OPT=20;
+
+if [[ ! -z "${help+x}" ]]; then
+    show_options;
+    exit 0;
+fi
+
+if [[ ! -z "${dir+x}" ]]; then
+    OUTPUT_DIR="$dir";
+fi
+if [[ ! -z "${ldlat+x}" ]]; then
+    LDLAT_OPT="$ldlat";
+fi
+
+OCPERFRUN_COMMAND_FINAL="";
+FREQ_OPT="--freq=100000";
+VERBOSE_OPT="";
+ALL_CPU_OPT="";
+OCPERF_COMMAND1="";
+OCPERF_COMMAND2="";
+# perf record --call-graph lbr
+OCPERF_RECORD_COMMAND1="nice -n -20 ocperf record --strict-freq";
+OCPERF_RECORD_COMMAND2="--buildid-all --all-user --event cycles:u --branch-filter any,u --output";
+OCPERF_MEM_COMMAND1="nice -n -20 ocperf record --strict-freq";
+OCPERF_MEM_COMMAND2="--buildid-all --all-user --data-page-size --data --weight --event cpu/mem-loads,ldlat=${LDLAT_OPT}/P --output";
+OCPERF_FULL_COMMAND1="nice -n -20 ocperf record --strict-freq";
+OCPERF_FULL_COMMAND2="--data --weight --event cpu/mem-loads,ldlat=${LDLAT_OPT}/pp --event cycles:u --branch-filter any,u --output";
+# OCPERF_FULL_COMMAND2="--buildid-all --all-user --data-page-size --data --weight --event cpu/mem-loads,ldlat=${LDLAT_OPT}/P --event cycles:u --branch-filter any,u --output";
+# OCPERF_FULL_COMMAND2="--data-page-size --code-page-size --data --phys-data --weight --event cpu/mem-loads,ldlat=${LDLAT_OPT}/P --event cycles:u --branch-filter any,u --output";
+
+if [[ ! -z "${freq+x}" ]]; then
+    FREQ_OPT="--freq=${freq}";
+fi
+if [[ ! -z "${verbose+x}" ]]; then
+    VERBOSE_OPT="--verbose";
+fi
+if [[ ! -z "${allcpu+x}" ]]; then
+    ALL_CPU_OPT="--all-cpus";
+fi
+
+if [[ "${OUTPUT_DIR: -1}" != "/" ]]; then
+    OUTPUT_DIR="${OUTPUT_DIR}/";
+fi
+
+PERFDATA_PATH="";
+PERFDATA_FILE="";
+LOGFILE="";
+if [[ ! -z "${mem+x}" ]]; then
+    OCPERF_COMMAND1="${OCPERF_MEM_COMMAND1}";
+    OCPERF_COMMAND2="${OCPERF_MEM_COMMAND2}";
+    PERFDATA_FILE="$(check_perfmem_exists $OUTPUT_DIR)";
+    PERFDATA_PATH="${OUTPUT_DIR}${PERFDATA_FILE}"
+    LOGFILE="ocperfrun-mem.txt";
+elif [[ ! -z "${full+x}" ]]; then
+    OCPERF_COMMAND1="${OCPERF_FULL_COMMAND1}";
+    OCPERF_COMMAND2="${OCPERF_FULL_COMMAND2}";
+    PERFDATA_FILE="$(check_perflbr_exists $OUTPUT_DIR)";
+    PERFDATA_PATH="${OUTPUT_DIR}${PERFDATA_FILE}"
+    LOGFILE="ocperfrun-lbr-mem.txt";
+else
+    OCPERF_COMMAND1="${OCPERF_RECORD_COMMAND1}";
+    OCPERF_COMMAND2="${OCPERF_RECORD_COMMAND2}";
+    PERFDATA_FILE="$(check_perflbr_exists $OUTPUT_DIR)";
+    PERFDATA_PATH="${OUTPUT_DIR}${PERFDATA_FILE}"
+    LOGFILE="ocperfrun-lbr.txt";
+fi
+
+if [[ $LOGGING == "1" ]]; then
+    OCPERFRUN_COMMAND_FINAL="${OCPERF_COMMAND1} ${VERBOSE_OPT:+${VERBOSE_OPT}} ${ALL_CPU_OPT:+${ALL_CPU_OPT}} ${FREQ_OPT} ${OCPERF_COMMAND2} ${PERFDATA_PATH} -- "$(shell_quote "$@")" >> ${LOGFILE} 2>&1";
+elif [[ $VERBOSE == "1" ]]; then
+    OCPERFRUN_COMMAND_FINAL="$OCPERF_COMMAND1 ${VERBOSE_OPT:+${VERBOSE_OPT}} ${ALL_CPU_OPT:+${ALL_CPU_OPT}} ${FREQ_OPT} ${OCPERF_COMMAND2} ${PERFDATA_PATH} -- "$(shell_quote "$@")"";
+else
+    OCPERFRUN_COMMAND_FINAL="$OCPERF_COMMAND1 ${VERBOSE_OPT:+${VERBOSE_OPT}} ${ALL_CPU_OPT:+${ALL_CPU_OPT}} ${FREQ_OPT} ${OCPERF_COMMAND2} ${PERFDATA_PATH} -- "$(shell_quote "$@")" > /dev/null 2>&1";
+fi
+
+if [[ $LOGGING == "1" ]]; then
+    echo ${OCPERFRUN_COMMAND_FINAL} >> ${LOGFILE};
+    echo " " >> ${LOGFILE};
+fi
+eval "${OCPERFRUN_COMMAND_FINAL}";
+# echo "${OCPERFRUN_COMMAND_FINAL}";
+if [[ $LOGGING == "1" ]]; then
+    echo " " >> ${LOGFILE};
+    echo " " >> ${LOGFILE};
+fi
